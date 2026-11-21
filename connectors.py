@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import time
 from typing import Any
-
+import random 
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
@@ -65,17 +65,26 @@ def _fetch_jobspy_single_board(
     rows: list[dict[str, Any]] = []
     notes: list[str] = []
 
-    for term in search_terms:
+    # LinkedIn supports Boolean OR — combine multiple terms into 1 call to avoid burst 429s
+    if board == "linkedin" and len(search_terms) > 1:
+        effective_terms = [" OR ".join(f'"{t}"' for t in search_terms)]
+    else:
+        effective_terms = search_terms
+
+    # Without proxies, cap LinkedIn batch size and disable per-job description fetches
+    effective_results = min(results_per_query, 15) if (board == "linkedin" and not proxies) else results_per_query
+    effective_fetch_desc = fetch_descriptions if (board != "linkedin" or proxies) else False
+
+    for idx, term in enumerate(effective_terms):
         kwargs: dict[str, Any] = {
             "site_name": [board],
             "search_term": term,
             "location": location,
-            "results_wanted": results_per_query,
+            "results_wanted": effective_results,
             "country_indeed": country_indeed,
-            "fetch_description": fetch_descriptions,
+            "fetch_description": effective_fetch_desc,
             "verbose": 0,
         }
-        # Avoid JobSpy filter conflicts on Indeed (hours_old vs is_remote)
         if remote_only:
             kwargs["is_remote"] = True
         elif hours_old:
@@ -84,58 +93,64 @@ def _fetch_jobspy_single_board(
         if proxies:
             kwargs["proxies"] = proxies
 
-        try:
-            df = scrape_jobs(**kwargs)
-            errors = df.attrs.get("errors", {})
-            if errors:
-                notes.append(f"{term}: {errors}")
+        max_attempts = 2 if board == "linkedin" else 1
+        for attempt in range(max_attempts):
+            try:
+                df = scrape_jobs(**kwargs)
+                errors = df.attrs.get("errors", {})
+                err_text = str(errors)
 
-            for _, r in df.iterrows():
-                skills_raw = _safe_val(r, "skills", "")
-                tags = [s.strip() for s in str(skills_raw).split(",") if s.strip()] if skills_raw else []
-                rows.append(
-                    {
-                        "source": str(_safe_val(r, "site", board)),
-                        "search_query": term,
-                        "title": _safe_val(r, "title", ""),
-                        "company": _safe_val(r, "company", ""),
-                        "company_url": _safe_val(r, "company_url", ""),
-                        "company_logo": _safe_val(r, "company_logo", ""),
-                        "company_industry": _safe_val(r, "company_industry", ""),
-                        "company_rating": _safe_val(r, "company_rating", None),
-                        "location": _safe_val(r, "location", ""),
-                        "is_remote": _safe_val(r, "is_remote", None),
-                        "job_type": _safe_val(r, "job_type", ""),
-                        "seniority": _safe_val(r, "job_level", ""),
-                        "experience": _safe_val(r, "experience_range", ""),
-                        "min_salary": _safe_val(r, "min_amount", None),
-                        "max_salary": _safe_val(r, "max_amount", None),
-                        "currency": _safe_val(r, "currency", None),
-                        "interval": _safe_val(r, "interval", None),
-                        "salary_text": "",
-                        "date_posted": str(_safe_val(r, "date_posted", "")),
-                        "expiry_date": "",
-                        "job_url": _safe_val(r, "job_url", ""),
-                        "apply_url": _safe_val(r, "job_url_direct", "") or _safe_val(r, "job_url", ""),
-                        "description": _safe_val(r, "description", ""),
-                        "tags": tags,
-                        "timezone_info": "",
-                        "visa_sponsorship": False,
-                    }
-                )
-        except Exception as exc:
-            notes.append(f"{term}: {exc}")
+                # If LinkedIn returns 429 on first attempt, wait 65s for burst window to clear and retry once
+                if board == "linkedin" and "429" in err_text and attempt == 0 and df.empty:
+                    time.sleep(65)
+                    continue
 
-        if len(search_terms) > 1:
-            time.sleep(1.5)
+                if errors:
+                    notes.append(f"{term}: {errors}")
+
+                for _, r in df.iterrows():
+                    skills_raw = _safe_val(r, "skills", "")
+                    tags = [s.strip() for s in str(skills_raw).split(",") if s.strip()] if skills_raw else []
+                    rows.append(
+                        {
+                            "source": str(_safe_val(r, "site", board)),
+                            "search_query": term,
+                            "title": _safe_val(r, "title", ""),
+                            "company": _safe_val(r, "company", ""),
+                            "company_url": _safe_val(r, "company_url", ""),
+                            "company_logo": _safe_val(r, "company_logo", ""),
+                            "company_industry": _safe_val(r, "company_industry", ""),
+                            "company_rating": _safe_val(r, "company_rating", None),
+                            "location": _safe_val(r, "location", ""),
+                            "is_remote": _safe_val(r, "is_remote", None),
+                            "job_type": _safe_val(r, "job_type", ""),
+                            "seniority": _safe_val(r, "job_level", ""),
+                            "experience": _safe_val(r, "experience_range", ""),
+                            "min_salary": _safe_val(r, "min_amount", None),
+                            "max_salary": _safe_val(r, "max_amount", None),
+                            "currency": _safe_val(r, "currency", None),
+                            "interval": _safe_val(r, "interval", None),
+                            "salary_text": "",
+                            "date_posted": str(_safe_val(r, "date_posted", "")),
+                            "expiry_date": "",
+                            "job_url": _safe_val(r, "job_url", ""),
+                            "apply_url": _safe_val(r, "job_url_direct", "") or _safe_val(r, "job_url", ""),
+                            "description": _safe_val(r, "description", ""),
+                            "tags": tags,
+                            "timezone_info": "",
+                            "visa_sponsorship": False,
+                        }
+                    )
+                break
+            except Exception as exc:
+                notes.append(f"{term}: {exc}")
+                break
+
+        if idx < len(effective_terms) - 1:
+            time.sleep(random.uniform(6.0, 10.0) if board == "linkedin" else random.uniform(2.0, 4.0))
 
     latency = round(time.perf_counter() - t0, 2)
-    if notes and not rows:
-        status = "ERROR"
-    elif notes:
-        status = "WARNING"
-    else:
-        status = "OK"
+    status = "ERROR" if (notes and not rows) else ("WARNING" if notes else "OK")
     return rows, ConnectorHealth(board, status, len(rows), latency, "; ".join(notes) or "Success")
 
 
